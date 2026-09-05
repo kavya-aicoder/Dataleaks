@@ -19,6 +19,9 @@ class SplitOverlapDetector(BaseDetector):
     # sufficiently likely to represent entities or keys.
     MIN_UNIQUE_RATIO = 0.95
 
+    # Evidence must remain bounded regardless of dataset size.
+    MAX_EVIDENCE_VALUES = 20
+
     _IDENTIFIER_PATTERN = re.compile(
         r"(^|_)("
         r"id|ids|uuid|guid|"
@@ -131,6 +134,11 @@ class SplitOverlapDetector(BaseDetector):
                 column in explicit_identifiers
             )
 
+            bounded_overlap_values = sorted(
+                overlap,
+                key=lambda value: str(value),
+            )[: self.MAX_EVIDENCE_VALUES]
+
             findings.append(
                 Finding(
                     detector=self.name,
@@ -156,7 +164,7 @@ class SplitOverlapDetector(BaseDetector):
                         "train_unique_values": len(train_unique),
                         "test_unique_values": test_unique_count,
                         "overlap_ratio_in_test": overlap_ratio,
-                        "overlap_values": list(overlap),
+                        "overlap_values": bounded_overlap_values,
                         "name_matches_identifier_pattern": (
                             name_matches_identifier
                         ),
@@ -165,6 +173,9 @@ class SplitOverlapDetector(BaseDetector):
                         ),
                         "unique_ratio_threshold": (
                             self.MIN_UNIQUE_RATIO
+                        ),
+                        "evidence_values_limit": (
+                            self.MAX_EVIDENCE_VALUES
                         ),
                     },
                 )

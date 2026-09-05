@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from dataleaks.detectors.temporal.parsing import (
-    parse_timestamps,
-)
+from dataleaks.detectors.temporal.parsing import parse_timestamps
 from dataleaks.engine.detector import BaseDetector
 from dataleaks.schemas.dataset import DatasetContext
 from dataleaks.schemas.finding import Finding
@@ -128,9 +126,12 @@ class FutureFeatureDetector(BaseDetector):
         raw_series: pd.Series,
         parse_result,
     ) -> pd.Series:
+        """Identify invalid feature timestamps."""
+
         invalid_mask = (
             raw_series.notna()
             & parse_result.values.isna()
+            & ~parse_result.ambiguous_mask
         )
 
         conditional_config = self._get_conditional_config(
@@ -149,15 +150,12 @@ class FutureFeatureDetector(BaseDetector):
 
         missing_mask = raw_series.isna()
 
-        invalid_missing_mask = (
+        unexpected_missing_mask = (
             missing_mask
             & expected_present
         )
 
-        return (
-            invalid_mask
-            | invalid_missing_mask
-        )
+        return invalid_mask | unexpected_missing_mask
 
     def _build_prediction_invalid_mask(
         self,
@@ -165,13 +163,7 @@ class FutureFeatureDetector(BaseDetector):
         raw_series: pd.Series,
         parse_result,
     ) -> tuple[pd.Series, dict | None]:
-        """
-        Build the invalid prediction-time mask.
-
-        Prediction timestamps may also have conditional presence.
-        For example, an outcome timestamp may only be expected when
-        the target indicates that the outcome occurred.
-        """
+        """Build the invalid prediction-time mask."""
 
         invalid_mask = (
             raw_series.notna()
@@ -198,15 +190,157 @@ class FutureFeatureDetector(BaseDetector):
 
         missing_mask = raw_series.isna()
 
-        invalid_missing_mask = (
+        unexpected_missing_mask = (
             missing_mask
             & expected_present
         )
 
         return (
-            invalid_mask | invalid_missing_mask,
+            invalid_mask | unexpected_missing_mask,
             conditional_config,
         )
+
+    def _prediction_missingness_summary(
+        self,
+        context: DatasetContext,
+        raw_series: pd.Series,
+        parse_result,
+    ) -> dict[str, int]:
+        """Summarize prediction timestamp availability."""
+
+        conditional_config = self._get_conditional_config(
+            context,
+            self.prediction_time_column,
+        )
+
+        missing_mask = raw_series.isna()
+
+        invalid_mask = (
+            raw_series.notna()
+            & parse_result.values.isna()
+            & ~parse_result.ambiguous_mask
+        )
+
+        ambiguous_mask = parse_result.ambiguous_mask
+
+        if conditional_config is None:
+            expected_missing_mask = pd.Series(
+                False,
+                index=context.data.index,
+            )
+        else:
+            expected_present, _ = self._get_conditional_target(
+                context,
+                self.prediction_time_column,
+                conditional_config,
+            )
+
+            expected_missing_mask = (
+                missing_mask
+                & ~expected_present
+            )
+
+        unexpected_missing_mask = (
+            missing_mask
+            & ~expected_missing_mask
+        )
+
+        return {
+            "missing_count": int(
+                missing_mask.sum()
+            ),
+            "expected_missing_count": int(
+                expected_missing_mask.sum()
+            ),
+            "unexpected_missing_count": int(
+                unexpected_missing_mask.sum()
+            ),
+            "invalid_count": int(
+                invalid_mask.sum()
+            ),
+            "ambiguous_count": int(
+                ambiguous_mask.sum()
+            ),
+        }
+
+    def _feature_missingness_summary(
+        self,
+        context: DatasetContext,
+        column: str,
+        raw_series: pd.Series,
+        parse_result,
+    ) -> dict[str, int]:
+        """Summarize feature timestamp availability."""
+
+        conditional_config = self._get_conditional_config(
+            context,
+            column,
+        )
+
+        missing_mask = raw_series.isna()
+
+        invalid_mask = (
+            raw_series.notna()
+            & parse_result.values.isna()
+            & ~parse_result.ambiguous_mask
+        )
+
+        ambiguous_mask = parse_result.ambiguous_mask
+
+        if conditional_config is None:
+            expected_missing_mask = pd.Series(
+                False,
+                index=context.data.index,
+            )
+        else:
+            expected_present, _ = self._get_conditional_target(
+                context,
+                column,
+                conditional_config,
+            )
+
+            expected_missing_mask = (
+                missing_mask
+                & ~expected_present
+            )
+
+        unexpected_missing_mask = (
+            missing_mask
+            & ~expected_missing_mask
+        )
+
+        return {
+            "missing_count": int(
+                missing_mask.sum()
+            ),
+            "expected_missing_count": int(
+                expected_missing_mask.sum()
+            ),
+            "unexpected_missing_count": int(
+                unexpected_missing_mask.sum()
+            ),
+            "invalid_count": int(
+                invalid_mask.sum()
+            ),
+            "ambiguous_count": int(
+                ambiguous_mask.sum()
+            ),
+        }
+
+    @staticmethod
+    def _safe_value(value: object) -> object:
+        """Convert a value into a JSON-safe representation."""
+
+        if value is None:
+            return None
+
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+
+        return str(value)
 
     def detect(
         self,
@@ -230,8 +364,12 @@ class FutureFeatureDetector(BaseDetector):
                 f"Temporal columns are missing: {missing}"
             )
 
+        prediction_raw = data[
+            self.prediction_time_column
+        ]
+
         prediction_result = parse_timestamps(
-            data[self.prediction_time_column]
+            prediction_raw
         )
 
         prediction_time = prediction_result.values
@@ -241,8 +379,16 @@ class FutureFeatureDetector(BaseDetector):
             prediction_conditional_config,
         ) = self._build_prediction_invalid_mask(
             context,
-            data[self.prediction_time_column],
+            prediction_raw,
             prediction_result,
+        )
+
+        prediction_missingness = (
+            self._prediction_missingness_summary(
+                context,
+                prediction_raw,
+                prediction_result,
+            )
         )
 
         findings: list[Finding] = []
@@ -256,24 +402,37 @@ class FutureFeatureDetector(BaseDetector):
 
             feature_time = feature_result.values
 
+            conditional_config = (
+                self._get_conditional_config(
+                    context,
+                    column,
+                )
+            )
+
+            invalid_feature_mask = (
+                self._build_invalid_mask(
+                    context,
+                    column,
+                    raw_feature_time,
+                    feature_result,
+                )
+            )
+
             invalid_prediction_count = int(
                 prediction_invalid_mask.sum()
             )
 
-            conditional_config = self._get_conditional_config(
-                context,
-                column,
-            )
-
-            invalid_feature_mask = self._build_invalid_mask(
-                context,
-                column,
-                raw_feature_time,
-                feature_result,
-            )
-
             invalid_feature_count = int(
                 invalid_feature_mask.sum()
+            )
+
+            feature_missingness = (
+                self._feature_missingness_summary(
+                    context,
+                    column,
+                    raw_feature_time,
+                    feature_result,
+                )
             )
 
             conditional_configured = (
@@ -282,8 +441,9 @@ class FutureFeatureDetector(BaseDetector):
             )
 
             # --------------------------------------------------
-            # Ambiguous timestamp evidence
+            # Ambiguous timestamps
             # --------------------------------------------------
+
             ambiguous_mask = (
                 prediction_result.ambiguous_mask
                 | feature_result.ambiguous_mask
@@ -291,77 +451,57 @@ class FutureFeatureDetector(BaseDetector):
 
             ambiguous_rows: list[dict[str, object]] = []
 
-            ambiguous_indices = data.index[
+            for row_index in data.index[
                 ambiguous_mask
-            ]
-
-            for row_index in ambiguous_indices[
-                : self.MAX_EVIDENCE_ROWS
-            ]:
+            ][: self.MAX_EVIDENCE_ROWS]:
                 ambiguous_rows.append(
                     {
                         "row_index": row_index,
-                        "prediction_time": str(
+                        "prediction_time": self._safe_value(
                             data.loc[
                                 row_index,
                                 self.prediction_time_column,
                             ]
                         ),
-                        "feature_time": str(
+                        "feature_time": self._safe_value(
                             data.loc[
                                 row_index,
                                 column,
                             ]
                         ),
                         "prediction_time_ambiguous": bool(
-                            prediction_result.ambiguous_mask.loc[
-                                row_index
-                            ]
+                            prediction_result
+                            .ambiguous_mask
+                            .loc[row_index]
                         ),
                         "feature_time_ambiguous": bool(
-                            feature_result.ambiguous_mask.loc[
-                                row_index
-                            ]
+                            feature_result
+                            .ambiguous_mask
+                            .loc[row_index]
                         ),
                     }
                 )
 
             if ambiguous_rows:
-                total_rows = len(data)
-
-                ambiguous_count = int(
-                    ambiguous_mask.sum()
-                )
-
-                ambiguous_ratio = (
-                    ambiguous_count / total_rows
-                    if total_rows
-                    else 0.0
-                )
-
-                if ambiguous_ratio >= 0.5:
-                    severity = "high"
-                elif ambiguous_ratio >= 0.1:
-                    severity = "medium"
-                else:
-                    severity = "low"
-
                 findings.append(
                     Finding(
                         detector=self.name,
                         category=self.category,
-                        severity=severity,
-                        confidence=ambiguous_ratio,
+                        severity="medium",
+                        confidence=min(
+                            1.0,
+                            int(ambiguous_mask.sum())
+                            / max(len(data), 1),
+                        ),
                         explanation=(
                             f"Temporal column '{column}' contains "
-                            f"{ambiguous_count} row(s) with ambiguous "
-                            "date formats that cannot be safely "
-                            "interpreted."
+                            f"{int(ambiguous_mask.sum())} row(s) "
+                            "with ambiguous timestamp formats."
                         ),
                         recommendation=(
-                            f"Use an explicit date format for "
-                            f"'{column}' so temporal ordering can "
-                            "be evaluated without guessing."
+                            f"Normalize '{self.prediction_time_column}' "
+                            f"and '{column}' to an explicit timestamp "
+                            "format."
                         ),
                         affected_columns=[
                             self.prediction_time_column,
@@ -373,8 +513,9 @@ class FutureFeatureDetector(BaseDetector):
                                 self.prediction_time_column
                             ),
                             "feature_time_column": column,
-                            "ambiguous_count": ambiguous_count,
-                            "ambiguous_ratio": ambiguous_ratio,
+                            "ambiguous_count": int(
+                                ambiguous_mask.sum()
+                            ),
                             "ambiguous_rows": ambiguous_rows,
                             "evidence_limit": (
                                 self.MAX_EVIDENCE_ROWS
@@ -385,49 +526,45 @@ class FutureFeatureDetector(BaseDetector):
                             "feature_inferred_format": (
                                 feature_result.inferred_format
                             ),
+                            "conditional_configured": (
+                                conditional_configured
+                            ),
                         },
                     )
                 )
 
             # --------------------------------------------------
-            # Invalid timestamp evidence
+            # Invalid timestamps
             # --------------------------------------------------
+
             invalid_mask = (
                 prediction_invalid_mask
                 | invalid_feature_mask
             )
 
-            invalid_rows: list[dict[str, object]] = []
-
             invalid_indices = data.index[
                 invalid_mask
             ]
 
+            invalid_rows: list[dict[str, object]] = []
+
             for row_index in invalid_indices[
                 : self.MAX_EVIDENCE_ROWS
             ]:
-                prediction_value = data.loc[
-                    row_index,
-                    self.prediction_time_column,
-                ]
-
-                feature_value = data.loc[
-                    row_index,
-                    column,
-                ]
-
                 invalid_rows.append(
                     {
                         "row_index": row_index,
-                        "prediction_time": (
-                            None
-                            if pd.isna(prediction_value)
-                            else str(prediction_value)
+                        "prediction_time": self._safe_value(
+                            data.loc[
+                                row_index,
+                                self.prediction_time_column,
+                            ]
                         ),
-                        "feature_time": (
-                            None
-                            if pd.isna(feature_value)
-                            else str(feature_value)
+                        "feature_time": self._safe_value(
+                            data.loc[
+                                row_index,
+                                column,
+                            ]
                         ),
                         "prediction_time_invalid": bool(
                             prediction_invalid_mask.loc[
@@ -443,40 +580,37 @@ class FutureFeatureDetector(BaseDetector):
                 )
 
             if invalid_mask.any():
-                total_rows = len(data)
-
                 invalid_count = int(
                     invalid_mask.sum()
                 )
 
-                invalid_ratio = (
-                    invalid_count / total_rows
-                    if total_rows
-                    else 0.0
+                severity = (
+                    "high"
+                    if invalid_count
+                    / max(len(data), 1)
+                    >= 0.25
+                    else "low"
                 )
-
-                if invalid_ratio >= 0.5:
-                    severity = "high"
-                elif invalid_ratio >= 0.1:
-                    severity = "medium"
-                else:
-                    severity = "low"
 
                 findings.append(
                     Finding(
                         detector=self.name,
                         category=self.category,
                         severity=severity,
-                        confidence=invalid_ratio,
+                        confidence=min(
+                            1.0,
+                            invalid_count
+                            / max(len(data), 1),
+                        ),
                         explanation=(
                             f"Temporal column '{column}' contains "
-                            f"{invalid_count} row(s) with invalid or "
-                            "unparseable timestamps."
+                            f"{invalid_count} row(s) with invalid "
+                            "or unparseable timestamps."
                         ),
                         recommendation=(
                             f"Validate and normalize timestamp values "
                             f"in '{self.prediction_time_column}' and "
-                            f"'{column}' before temporal leakage analysis."
+                            f"'{column}'."
                         ),
                         affected_columns=[
                             self.prediction_time_column,
@@ -495,8 +629,17 @@ class FutureFeatureDetector(BaseDetector):
                             "invalid_feature_count": (
                                 invalid_feature_count
                             ),
-                            "total_rows": total_rows,
-                            "invalid_ratio": invalid_ratio,
+                            "total_rows": len(data),
+                            "invalid_ratio": (
+                                invalid_count
+                                / max(len(data), 1)
+                            ),
+                            "prediction_missingness": (
+                                prediction_missingness
+                            ),
+                            "feature_missingness": (
+                                feature_missingness
+                            ),
                             "invalid_rows": invalid_rows,
                             "evidence_limit": (
                                 self.MAX_EVIDENCE_ROWS
@@ -509,25 +652,33 @@ class FutureFeatureDetector(BaseDetector):
                 )
 
             # --------------------------------------------------
-            # Future timestamp comparison
+            # Comparable rows
             # --------------------------------------------------
-            comparable = (
+
+            comparable_mask = (
                 prediction_time.notna()
                 & feature_time.notna()
+                & ~prediction_invalid_mask
+                & ~invalid_feature_mask
                 & ~prediction_result.ambiguous_mask
                 & ~feature_result.ambiguous_mask
             )
 
             comparable_count = int(
-                comparable.sum()
+                comparable_mask.sum()
             )
 
             if comparable_count == 0:
                 continue
 
+            # --------------------------------------------------
+            # Future feature detection
+            # --------------------------------------------------
+
             future_mask = (
-                feature_time > prediction_time
-            ) & comparable
+                comparable_mask
+                & (feature_time > prediction_time)
+            )
 
             future_count = int(
                 future_mask.sum()
@@ -537,52 +688,67 @@ class FutureFeatureDetector(BaseDetector):
                 continue
 
             future_ratio = (
-                future_count / comparable_count
+                future_count
+                / comparable_count
             )
 
-            if future_ratio >= 0.5:
+            # Preserve the established detector semantics:
+            #
+            # >= 50% -> critical
+            # >= 10% -> high
+            # otherwise -> medium
+            if future_ratio >= 0.50:
                 severity = "critical"
-            elif future_ratio >= 0.1:
+            elif future_ratio >= 0.10:
                 severity = "high"
             else:
                 severity = "medium"
 
+            # Confidence represents the actual observed violation ratio.
+            confidence = future_ratio
+
             violating_rows: list[dict[str, object]] = []
 
-            violating_indices = data.index[
+            for row_index in data.index[
                 future_mask
-            ]
-
-            for row_index in violating_indices[
-                : self.MAX_EVIDENCE_ROWS
-            ]:
+            ][: self.MAX_EVIDENCE_ROWS]:
                 violating_rows.append(
                     {
                         "row_index": row_index,
-                        "prediction_time": str(
-                            prediction_time.loc[row_index]
+                        "prediction_time": self._safe_value(
+                            prediction_time.loc[
+                                row_index
+                            ]
                         ),
-                        "feature_time": str(
-                            feature_time.loc[row_index]
+                        "feature_time": self._safe_value(
+                            feature_time.loc[
+                                row_index
+                            ]
                         ),
                     }
                 )
+
+            excluded_count = (
+                len(data)
+                - comparable_count
+            )
 
             findings.append(
                 Finding(
                     detector=self.name,
                     category=self.category,
                     severity=severity,
-                    confidence=future_ratio,
+                    confidence=confidence,
                     explanation=(
-                        f"Feature timestamp '{column}' occurs after "
-                        f"the prediction timestamp in {future_count} "
-                        f"of {comparable_count} comparable rows."
+                        f"Feature timestamp '{column}' occurs "
+                        "after the prediction timestamp in "
+                        f"{future_count} of "
+                        f"{comparable_count} comparable rows."
                     ),
                     recommendation=(
-                        f"Ensure '{column}' is available at or before "
-                        f"'{self.prediction_time_column}' when generating "
-                        "the prediction."
+                        f"Ensure '{column}' is available at or "
+                        f"before '{self.prediction_time_column}' "
+                        "when generating predictions."
                     ),
                     affected_columns=[
                         self.prediction_time_column,
@@ -596,10 +762,20 @@ class FutureFeatureDetector(BaseDetector):
                         "feature_time_column": column,
                         "future_count": future_count,
                         "comparable_count": comparable_count,
+                        "excluded_count": excluded_count,
                         "future_ratio": future_ratio,
+                        "prediction_missingness": (
+                            prediction_missingness
+                        ),
+                        "feature_missingness": (
+                            feature_missingness
+                        ),
                         "violating_rows": violating_rows,
                         "evidence_limit": (
                             self.MAX_EVIDENCE_ROWS
+                        ),
+                        "conditional_configured": (
+                            conditional_configured
                         ),
                     },
                 )

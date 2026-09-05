@@ -10,7 +10,9 @@ from dataleaks.schemas.finding import Finding
 
 
 class SuspiciousFeatureDetector(BaseDetector):
-    """Detect features with unusually strong target relationships."""
+    """Detect features with unusually strong or semantically suspicious
+    relationships with the target.
+    """
 
     name = "feature_suspicious"
     category = "feature_leakage"
@@ -28,7 +30,31 @@ class SuspiciousFeatureDetector(BaseDetector):
         r"post[_-]?refund|"
         r"after[_-]?refund|"
         r"post[_-]?result|"
-        r"after[_-]?result"
+        r"after[_-]?result|"
+        r"post[_-]?event|"
+        r"after[_-]?event"
+        r")",
+        re.IGNORECASE,
+    )
+
+    _FUTURE_PATTERN = re.compile(
+        r"("
+        r"^future[_-]|"
+        r"[_-]future$|"
+        r"^next[_-]|"
+        r"[_-]next$|"
+        r"^upcoming[_-]|"
+        r"[_-]upcoming$|"
+        r"^subsequent[_-]|"
+        r"[_-]subsequent$|"
+        r"^projected[_-]|"
+        r"[_-]projected$|"
+        r"^forecast[_-]|"
+        r"[_-]forecast$|"
+        r"^post[_-]|"
+        r"[_-]post$|"
+        r"^after[_-]|"
+        r"[_-]after$"
         r")",
         re.IGNORECASE,
     )
@@ -38,6 +64,7 @@ class SuspiciousFeatureDetector(BaseDetector):
         correlation_threshold: float = 0.999,
         min_samples: int = 10,
         post_outcome_correlation_threshold: float = 0.90,
+        future_correlation_threshold: float = 0.90,
     ) -> None:
         if not 0.0 <= correlation_threshold <= 1.0:
             raise ValueError(
@@ -55,10 +82,19 @@ class SuspiciousFeatureDetector(BaseDetector):
                 "between 0.0 and 1.0"
             )
 
+        if not 0.0 <= future_correlation_threshold <= 1.0:
+            raise ValueError(
+                "future_correlation_threshold must be "
+                "between 0.0 and 1.0"
+            )
+
         self.correlation_threshold = correlation_threshold
         self.min_samples = min_samples
         self.post_outcome_correlation_threshold = (
             post_outcome_correlation_threshold
+        )
+        self.future_correlation_threshold = (
+            future_correlation_threshold
         )
 
     def detect(
@@ -74,9 +110,7 @@ class SuspiciousFeatureDetector(BaseDetector):
         if target not in data.columns:
             return []
 
-        if not pd.api.types.is_numeric_dtype(
-            data[target]
-        ):
+        if not pd.api.types.is_numeric_dtype(data[target]):
             return []
 
         findings: list[Finding] = []
@@ -101,19 +135,13 @@ class SuspiciousFeatureDetector(BaseDetector):
             feature_values = pair.iloc[:, 0]
             target_values = pair.iloc[:, 1]
 
-            if feature_values.nunique(
-                dropna=True
-            ) <= 1:
+            if feature_values.nunique(dropna=True) <= 1:
                 continue
 
-            if target_values.nunique(
-                dropna=True
-            ) <= 1:
+            if target_values.nunique(dropna=True) <= 1:
                 continue
 
-            correlation = feature_values.corr(
-                target_values
-            )
+            correlation = feature_values.corr(target_values)
 
             if pd.isna(correlation):
                 continue
@@ -121,30 +149,22 @@ class SuspiciousFeatureDetector(BaseDetector):
             correlation = float(correlation)
 
             if abs(abs(correlation) - 1.0) <= 1e-12:
-                correlation = (
-                    1.0
-                    if correlation > 0
-                    else -1.0
-                )
+                correlation = 1.0 if correlation > 0 else -1.0
             else:
-                correlation = max(
-                    -1.0,
-                    min(1.0, correlation),
-                )
+                correlation = max(-1.0, min(1.0, correlation))
 
-            absolute_correlation = abs(
-                correlation
-            )
+            absolute_correlation = abs(correlation)
 
             is_post_outcome = bool(
-                self._POST_OUTCOME_PATTERN.search(
-                    column
-                )
+                self._POST_OUTCOME_PATTERN.search(column)
+            )
+
+            is_future_semantic = bool(
+                self._FUTURE_PATTERN.search(column)
             )
 
             standard_threshold_met = (
-                absolute_correlation
-                >= self.correlation_threshold
+                absolute_correlation >= self.correlation_threshold
             )
 
             post_outcome_threshold_met = (
@@ -153,22 +173,52 @@ class SuspiciousFeatureDetector(BaseDetector):
                 >= self.post_outcome_correlation_threshold
             )
 
+            future_threshold_met = (
+                is_future_semantic
+                and absolute_correlation
+                >= self.future_correlation_threshold
+            )
+
             if not (
                 standard_threshold_met
                 or post_outcome_threshold_met
+                or future_threshold_met
             ):
                 continue
 
-            if post_outcome_threshold_met:
+            if future_threshold_met:
                 severity = "high"
+                evidence_type = "future_semantic_feature"
+                detection_reason = (
+                    "future/post-event semantic feature name "
+                    "combined with strong target relationship"
+                )
+            elif post_outcome_threshold_met:
+                severity = "high"
+                evidence_type = "post_outcome_feature"
                 detection_reason = (
                     "post-outcome feature name combined "
                     "with strong target correlation"
                 )
             else:
                 severity = "high"
+                evidence_type = "suspicious_target_relationship"
                 detection_reason = (
                     "extremely strong target correlation"
+                )
+
+            semantic_warning = ""
+
+            if future_threshold_met:
+                semantic_warning = (
+                    " Its name suggests that the value may "
+                    "represent future, projected, or post-event "
+                    "information."
+                )
+            elif is_post_outcome:
+                semantic_warning = (
+                    " Its name suggests that the feature may "
+                    "contain post-outcome information."
                 )
 
             findings.append(
@@ -182,32 +232,22 @@ class SuspiciousFeatureDetector(BaseDetector):
                         "suspiciously strong relationship "
                         f"with target '{target}' "
                         f"(|correlation|="
-                        f"{absolute_correlation:.4f}). "
-                        + (
-                            "Its name also suggests that "
-                            "the feature may contain "
-                            "post-outcome information. "
-                            if is_post_outcome
-                            else ""
-                        )
-                        + "This may indicate target-derived "
-                        "or post-outcome information."
+                        f"{absolute_correlation:.4f})."
+                        f"{semantic_warning} "
+                        "This may indicate target-derived "
+                        "or future/post-outcome information."
                     ),
                     recommendation=(
                         f"Review how '{column}' is generated "
-                        "and whether it is available at "
-                        "prediction time. Verify that the "
-                        "feature does not contain "
-                        "target-derived or post-outcome "
-                        "information."
+                        "and whether it is available before "
+                        "prediction time. Remove it or rebuild "
+                        "the feature using information available "
+                        "at prediction time if it contains "
+                        "future or target-derived information."
                     ),
                     affected_columns=[column],
                     evidence={
-                        "type": (
-                            "post_outcome_feature"
-                            if post_outcome_threshold_met
-                            else "suspicious_target_relationship"
-                        ),
+                        "type": evidence_type,
                         "feature": column,
                         "target": target,
                         "absolute_correlation": (
@@ -220,8 +260,14 @@ class SuspiciousFeatureDetector(BaseDetector):
                         "post_outcome_threshold": (
                             self.post_outcome_correlation_threshold
                         ),
+                        "future_correlation_threshold": (
+                            self.future_correlation_threshold
+                        ),
                         "post_outcome_name_signal": (
                             is_post_outcome
+                        ),
+                        "future_semantic_name_signal": (
+                            is_future_semantic
                         ),
                         "detection_reason": detection_reason,
                         "samples": len(pair),

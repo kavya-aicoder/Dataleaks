@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import pandas as pd
 
@@ -15,6 +16,8 @@ class IdentifierLeakageDetector(BaseDetector):
     name = "feature_identifier"
     category = "feature_leakage"
 
+    MAX_EVIDENCE_ROWS = 20
+
     _IDENTIFIER_PATTERN = re.compile(
         r"(^|_)("
         r"id|ids|uuid|guid|"
@@ -26,7 +29,10 @@ class IdentifierLeakageDetector(BaseDetector):
         re.IGNORECASE,
     )
 
-    def __init__(self, uniqueness_threshold: float = 0.95) -> None:
+    def __init__(
+        self,
+        uniqueness_threshold: float = 0.95,
+    ) -> None:
         if not 0.0 <= uniqueness_threshold <= 1.0:
             raise ValueError(
                 "uniqueness_threshold must be between 0.0 and 1.0"
@@ -34,7 +40,57 @@ class IdentifierLeakageDetector(BaseDetector):
 
         self.uniqueness_threshold = uniqueness_threshold
 
-    def detect(self, context: DatasetContext) -> list[Finding]:
+    @staticmethod
+    def _safe_value(value: Any) -> str | None:
+        """Return a bounded representation for evidence."""
+
+        if value is None:
+            return None
+
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+
+        value = str(value)
+
+        if len(value) > 64:
+            return value[:61] + "..."
+
+        return value
+
+    def _build_identifier_evidence(
+        self,
+        context: DatasetContext,
+        column: str,
+    ) -> list[dict[str, object]]:
+        """Build bounded row-level evidence."""
+
+        evidence: list[dict[str, object]] = []
+
+        for row_index, value in context.data[column].items():
+            if pd.isna(value):
+                continue
+
+            evidence.append(
+                {
+                    "row_index": row_index,
+                    "identifier_value": self._safe_value(
+                        value
+                    ),
+                }
+            )
+
+            if len(evidence) >= self.MAX_EVIDENCE_ROWS:
+                break
+
+        return evidence
+
+    def detect(
+        self,
+        context: DatasetContext,
+    ) -> list[Finding]:
         findings: list[Finding] = []
 
         explicit_identifiers = context.metadata.get(
@@ -73,32 +129,39 @@ class IdentifierLeakageDetector(BaseDetector):
                 self._IDENTIFIER_PATTERN.search(column)
             )
 
-            explicit_match = column in explicit_identifiers
+            explicit_match = (
+                column in explicit_identifiers
+            )
 
-            # High cardinality alone is not enough evidence.
+            # High cardinality alone is not enough.
             if not name_match and not explicit_match:
                 continue
 
             overlap_count = 0
 
-            train = context.train
-            test = context.test
+            if (
+                context.train is not None
+                and context.test is not None
+                and column in context.train.columns
+                and column in context.test.columns
+            ):
+                train_values = set(
+                    context.train[column]
+                    .dropna()
+                    .tolist()
+                )
 
-            if train is not None and test is not None:
-                if column in train.columns and column in test.columns:
-                    train_values = set(
-                        train[column].dropna().tolist()
-                    )
+                test_values = set(
+                    context.test[column]
+                    .dropna()
+                    .tolist()
+                )
 
-                    test_values = set(
-                        test[column].dropna().tolist()
+                overlap_count = len(
+                    train_values.intersection(
+                        test_values
                     )
-
-                    overlap_count = len(
-                        train_values.intersection(
-                            test_values
-                        )
-                    )
+                )
 
             if overlap_count > 0:
                 severity = "high"
@@ -113,20 +176,16 @@ class IdentifierLeakageDetector(BaseDetector):
 
             elif uniqueness_ratio >= self.uniqueness_threshold:
                 severity = "medium"
-
                 confidence = uniqueness_ratio
 
             else:
                 severity = "low"
-
-                # Confidence should reflect the actual evidence
-                # continuously instead of dropping to an arbitrary
-                # 0.5 below the severity threshold.
                 confidence = uniqueness_ratio
 
             explanation = (
                 f"Feature '{column}' appears to be identifier-like "
-                f"with a uniqueness ratio of {uniqueness_ratio:.4f}."
+                f"with a uniqueness ratio of "
+                f"{uniqueness_ratio:.4f}."
             )
 
             if overlap_count > 0:
@@ -136,10 +195,32 @@ class IdentifierLeakageDetector(BaseDetector):
                 )
 
             recommendation = (
-                f"Review whether '{column}' should be available to the "
-                "model. If it identifies entities, ensure entity-level "
-                "separation between training and test data."
+                f"Review whether '{column}' should be available to "
+                "the model. If it identifies entities, ensure "
+                "entity-level separation between training and test "
+                "data."
             )
+
+            evidence = {
+                "type": "identifier_like_feature",
+                "column": column,
+                "uniqueness_ratio": uniqueness_ratio,
+                "name_matches_identifier_pattern": name_match,
+                "explicit_identifier": explicit_match,
+                "train_test_overlap_count": overlap_count,
+                "uniqueness_threshold": (
+                    self.uniqueness_threshold
+                ),
+                "evidence_limit": (
+                    self.MAX_EVIDENCE_ROWS
+                ),
+                "row_evidence": (
+                    self._build_identifier_evidence(
+                        context,
+                        column,
+                    )
+                ),
+            }
 
             findings.append(
                 Finding(
@@ -150,15 +231,7 @@ class IdentifierLeakageDetector(BaseDetector):
                     explanation=explanation,
                     recommendation=recommendation,
                     affected_columns=[column],
-                    evidence={
-                        "type": "identifier_like_feature",
-                        "column": column,
-                        "uniqueness_ratio": uniqueness_ratio,
-                        "name_matches_identifier_pattern": name_match,
-                        "explicit_identifier": explicit_match,
-                        "train_test_overlap_count": overlap_count,
-                        "uniqueness_threshold": self.uniqueness_threshold,
-                    },
+                    evidence=evidence,
                 )
             )
 

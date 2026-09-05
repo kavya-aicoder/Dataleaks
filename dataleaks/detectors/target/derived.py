@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pandas as pd
 
 from dataleaks.engine.detector import BaseDetector
@@ -15,11 +17,16 @@ class DerivedTargetLeakageDetector(BaseDetector):
 
     def __init__(self, tolerance: float = 1e-9) -> None:
         if tolerance < 0:
-            raise ValueError("tolerance must be non-negative")
+            raise ValueError(
+                "tolerance must be non-negative"
+            )
 
         self.tolerance = tolerance
 
-    def detect(self, context: DatasetContext) -> list[Finding]:
+    def detect(
+        self,
+        context: DatasetContext,
+    ) -> list[Finding]:
         if context.target is None:
             return []
 
@@ -52,10 +59,25 @@ class DerivedTargetLeakageDetector(BaseDetector):
             feature_values = pair.iloc[:, 0]
             target_values = pair.iloc[:, 1]
 
-            if self._is_affine_transform(feature_values, target_values):
-                scale, offset = self._fit_affine_transform(
-                    feature_values,
-                    target_values,
+            # A constant feature cannot be a meaningful affine
+            # transformation of a varying target.
+            if self._is_constant(feature_values):
+                continue
+
+            # A varying target is required for identifying a
+            # target-derived transformation.
+            if self._is_constant(target_values):
+                continue
+
+            if self._is_affine_transform(
+                feature_values,
+                target_values,
+            ):
+                scale, offset = (
+                    self._fit_affine_transform(
+                        feature_values,
+                        target_values,
+                    )
                 )
 
                 findings.append(
@@ -67,7 +89,8 @@ class DerivedTargetLeakageDetector(BaseDetector):
                         explanation=(
                             f"Feature '{column}' can be deterministically "
                             f"expressed as approximately "
-                            f"{scale:.6g} * '{target_name}' + {offset:.6g}."
+                            f"{scale:.6g} * '{target_name}' + "
+                            f"{offset:.6g}."
                         ),
                         recommendation=(
                             f"Remove '{column}' or verify that it is "
@@ -93,35 +116,85 @@ class DerivedTargetLeakageDetector(BaseDetector):
         feature: pd.Series,
         target: pd.Series,
     ) -> bool:
-        scale, offset = self._fit_affine_transform(feature, target)
+        # Both sides must contain actual variation.
+        if self._is_constant(feature):
+            return False
+
+        if self._is_constant(target):
+            return False
+
+        scale, offset = self._fit_affine_transform(
+            feature,
+            target,
+        )
+
+        # A zero-scale transformation represents a constant
+        # feature and therefore is not target leakage.
+        if abs(scale) <= self.tolerance:
+            return False
 
         predicted = target * scale + offset
 
         return bool(
-            (feature - predicted).abs().le(self.tolerance).all()
+            (feature - predicted)
+            .abs()
+            .le(self.tolerance)
+            .all()
         )
+
+    def _is_constant(
+        self,
+        series: pd.Series,
+    ) -> bool:
+        """Return True when a series has no meaningful variation."""
+
+        if series.empty:
+            return True
+
+        minimum = float(series.min())
+        maximum = float(series.max())
+
+        return abs(maximum - minimum) <= self.tolerance
 
     @staticmethod
     def _fit_affine_transform(
         feature: pd.Series,
         target: pd.Series,
     ) -> tuple[float, float]:
-        target_mean = float(target.mean())
-        feature_mean = float(feature.mean())
+        target_mean = float(
+            target.mean()
+        )
 
-        centered_target = target - target_mean
-        centered_feature = feature - feature_mean
+        feature_mean = float(
+            feature.mean()
+        )
 
-        denominator = float((centered_target**2).sum())
+        centered_target = (
+            target - target_mean
+        )
+
+        centered_feature = (
+            feature - feature_mean
+        )
+
+        denominator = float(
+            (centered_target**2).sum()
+        )
 
         if denominator == 0.0:
             return 0.0, feature_mean
 
         scale = float(
-            (centered_target * centered_feature).sum()
+            (
+                centered_target
+                * centered_feature
+            ).sum()
             / denominator
         )
 
-        offset = feature_mean - scale * target_mean
+        offset = (
+            feature_mean
+            - scale * target_mean
+        )
 
         return scale, float(offset)
